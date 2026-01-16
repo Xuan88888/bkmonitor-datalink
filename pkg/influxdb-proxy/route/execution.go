@@ -11,6 +11,7 @@ package route
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"net/http"
 	"runtime"
@@ -112,60 +113,76 @@ func (m *Manager) writeExecution(params *WriteParams, flowLog *logging.Entry) *E
 	pointsChannel := make(chan common.Points, 1000)
 	sem := make(chan struct{}, 100)
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // 确保函数退出时取消所有goroutine
+
+	defer func() {
+		close(pointsChannel)
+		wg.Wait() // 等待所有goroutine完成
+	}()
+
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for totalPoints := range pointsChannel {
-			// 将收到的points按库表分组
-			pointsMap := make(map[string]common.Points)
-			for _, point := range totalPoints {
-				route := FormatRoute(point.DB, point.Measurement)
-				if routePoints, ok := pointsMap[route]; !ok {
-					routePoints = make(common.Points, 0, batchSize)
-					routePoints = append(routePoints, point)
-					pointsMap[route] = routePoints
-				} else {
-					routePoints = append(routePoints, point)
-					pointsMap[route] = routePoints
+		for {
+			select {
+			case <-ctx.Done():
+				return // 被取消，立即退出
+			case totalPoints, ok := <-pointsChannel:
+				if !ok {
+					return // channel关闭，正常退出
 				}
-			}
+				// 将收到的points按库表分组
+				pointsMap := make(map[string]common.Points)
+				for _, point := range totalPoints {
+					route := FormatRoute(point.DB, point.Measurement)
+					if routePoints, ok := pointsMap[route]; !ok {
+						routePoints = make(common.Points, 0, batchSize)
+						routePoints = append(routePoints, point)
+						pointsMap[route] = routePoints
+					} else {
+						routePoints = append(routePoints, point)
+						pointsMap[route] = routePoints
+					}
+				}
 
-			for route, points := range pointsMap {
-				dbCluster, err := GetRouteCluster(flow, route)
-				if err != nil {
-					flowLog.Errorf("failed to get cluster for->[%s]", err)
-					mu.Lock()
-					stackedError = ErrMatchClusterByRouteFailed
-					mu.Unlock()
-					continue
-				}
-				_ = WriteClusterSendCountInc(dbCluster.GetName(), db)
-				sem <- struct{}{}
-				wg.Add(1)
-				go func(route string, points common.Points, dbCluster cluster.Cluster) {
-					defer wg.Done()
-					defer func() { <-sem }() // 释放信号量
-					tagNames := m.tagMap[route]
-					params := cluster.NewWriteParams(db, consistency, precision, rp, points, allPoints, tagNames)
-					localResp, err := dbCluster.Write(flow, params, header)
-					mu.Lock()
-					defer mu.Unlock()
+				for route, points := range pointsMap {
+					dbCluster, err := GetRouteCluster(flow, route)
 					if err != nil {
-						flowLog.Errorf("write to cluster->[%s],failed,error:%s", dbCluster.GetName(), err)
-						stackedError = ErrClusterWriteFailed
-						_ = WriteClusterFailedCountInc(dbCluster.GetName(), db)
-						return
+						flowLog.Errorf("failed to get cluster for->[%s]", err)
+						mu.Lock()
+						stackedError = ErrMatchClusterByRouteFailed
+						mu.Unlock()
+						continue
 					}
-					if localResp.Code >= 300 {
-						flowLog.Warnf("write to cluster->[%s] get wrong status code,response:%s", dbCluster.GetName(), localResp)
-						stackedResp = localResp
-					}
-					_ = WriteClusterSuccessCountInc(dbCluster.GetName(), db)
-					// 保留一个成功响应作为默认值 (如果还没有的话)
-					if clusterResp == nil && localResp.Code < 300 {
-						clusterResp = localResp
-					}
-				}(route, points, dbCluster)
+					_ = WriteClusterSendCountInc(dbCluster.GetName(), db)
+					sem <- struct{}{}
+					wg.Add(1)
+					go func(route string, points common.Points, dbCluster cluster.Cluster) {
+						defer wg.Done()
+						defer func() { <-sem }() // 释放信号量
+						tagNames := m.tagMap[route]
+						params := cluster.NewWriteParams(db, consistency, precision, rp, points, allPoints, tagNames)
+						localResp, err := dbCluster.Write(flow, params, header)
+						mu.Lock()
+						defer mu.Unlock()
+						if err != nil {
+							flowLog.Errorf("write to cluster->[%s],failed,error:%s", dbCluster.GetName(), err)
+							stackedError = ErrClusterWriteFailed
+							_ = WriteClusterFailedCountInc(dbCluster.GetName(), db)
+							return
+						}
+						if localResp.Code >= 300 {
+							flowLog.Warnf("write to cluster->[%s] get wrong status code,response:%s", dbCluster.GetName(), localResp)
+							stackedResp = localResp
+						}
+						_ = WriteClusterSuccessCountInc(dbCluster.GetName(), db)
+						// 保留一个成功响应作为默认值 (如果还没有的话)
+						if clusterResp == nil && localResp.Code < 300 {
+							clusterResp = localResp
+						}
+					}(route, points, dbCluster)
+				}
 			}
 		}
 	}()
@@ -178,8 +195,6 @@ func (m *Manager) writeExecution(params *WriteParams, flowLog *logging.Entry) *E
 		mu.Unlock()
 	}
 
-	close(pointsChannel)
-	flowLog.Debugf("wait for write done")
 	defer flowLog.Debugf("write done")
 	wg.Wait()
 	mu.Lock()
