@@ -10,6 +10,7 @@
 package main
 
 import (
+	"net/http"
 	_ "net/http/pprof"
 
 	_ "github.com/heralight/logrus_mate/hooks/file"
@@ -19,5 +20,8 @@ import (
 )
 
 func main() {
+	go func() {
+		http.ListenAndServe("localhost:6060", nil)
+	}()
 	cmd.Execute()
 }

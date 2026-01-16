@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"runtime"
 	"sync"
 
 	"github.com/spf13/viper"
@@ -65,8 +66,21 @@ func (m *Manager) getCreateDBExecution(_ *CreateDBParams, _ *logging.Entry) Crea
 	return m.createDBExecution
 }
 
+func logMemoryStats(flowLog *logging.Entry) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	flowLog.Infof("Memory Stats: Alloc=%vMB, TotalAlloc=%vMB, Sys=%vMB, NumGC=%v",
+		m.Alloc/1024/1024,
+		m.TotalAlloc/1024/1024,
+		m.Sys/1024/1024,
+		m.NumGC)
+}
+
 // writeExecution 写入语句处理
 func (m *Manager) writeExecution(params *WriteParams, flowLog *logging.Entry) *ExecuteResult {
+	defer logMemoryStats(flowLog)
+
 	db := params.DB
 	consistency := params.Consistency
 	precision := params.Precision
