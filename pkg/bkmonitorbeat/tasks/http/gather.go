@@ -67,7 +67,7 @@ func validateConfig(c *configs.HTTPTaskStepConfig) {
 }
 
 // makeResponseReader 从 response 获取 reader
-func makeResponseReader(response *http.Response) io.ReadCloser {
+func makeResponseReader(response *http.Response) (io.ReadCloser, func()) {
 	var (
 		err        error
 		responseRd io.ReadCloser
@@ -76,12 +76,30 @@ func makeResponseReader(response *http.Response) io.ReadCloser {
 		responseRd, err = gzip.NewReader(response.Body)
 		if err != nil {
 			logger.Errorf("make gzip reader failed: %v", err)
-			return nil
+			return nil, func() {}
+		}
+		return responseRd, func() {
+			if err := responseRd.Close(); err != nil {
+				logger.Debugf("close response reader error: %v", err)
+			}
 		}
 	} else {
 		responseRd = response.Body
 	}
-	return responseRd
+	return responseRd, func() {}
+}
+
+func drainAndCloseResponseBody(body io.ReadCloser) {
+	if body == nil {
+		return
+	}
+
+	if _, err := io.Copy(io.Discard, body); err != nil {
+		logger.Debugf("drain response body error: %v", err)
+	}
+	if err := body.Close(); err != nil {
+		logger.Debugf("close response body error: %v", err)
+	}
 }
 
 // checkResponseCode 检查返回是否符合配置
@@ -178,7 +196,7 @@ func (g *Gather) GatherURL(ctx context.Context, event *Event, step *configs.HTTP
 		event.FailFromError(err)
 		return false
 	}
-	defer response.Body.Close()
+	defer drainAndCloseResponseBody(response.Body)
 
 	logger.Infof("task(%d): %v %v response: code=%v", conf.TaskID, step.Method, url, response.StatusCode)
 	g.UpdateEventByResponse(event, response) // 根据结果设置事件字段
@@ -195,12 +213,12 @@ func (g *Gather) GatherURL(ctx context.Context, event *Event, step *configs.HTTP
 	}
 
 	// 读取响应内容明文reader
-	responseRd := makeResponseReader(response)
+	responseRd, closeResponseRd := makeResponseReader(response)
 	if responseRd == nil {
 		event.Fail(define.CodeResponseFailed)
 		return false
 	}
-	defer responseRd.Close()
+	defer closeResponseRd()
 
 	if step.Response != "" {
 		// 读取响应内容字符串

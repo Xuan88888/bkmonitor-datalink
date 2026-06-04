@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"testing"
@@ -288,4 +289,79 @@ func TestValidateConfig(t *testing.T) {
 		validateConfig(conf)
 		assert.Equal(t, *excepted, *conf)
 	})
+}
+
+type trackingReadCloser struct {
+	reader     *bytes.Reader
+	readToEOF  bool
+	closed     bool
+	closeCount int
+}
+
+func newTrackingReadCloser(body string) *trackingReadCloser {
+	return &trackingReadCloser{reader: bytes.NewReader([]byte(body))}
+}
+
+func (r *trackingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		r.readToEOF = true
+	}
+	return n, err
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	r.closeCount++
+	return nil
+}
+
+func (s *GatherSuite) TestGatherURLDrainsAndClosesResponseBody() {
+	tests := []struct {
+		name     string
+		response string
+		step     *configs.HTTPTaskStepConfig
+	}{
+		{
+			name:     "without response match",
+			response: "response body that should be drained",
+			step: &configs.HTTPTaskStepConfig{
+				URL:    "http://localhost/1",
+				Method: http.MethodGet,
+			},
+		},
+		{
+			name:     "with partial response match",
+			response: "test response body that should still be drained",
+			step: &configs.HTTPTaskStepConfig{
+				URL:    "http://localhost/1",
+				Method: http.MethodGet,
+				SimpleMatchParam: configs.SimpleMatchParam{
+					Response:       "test",
+					ResponseFormat: "startswith",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		s.T().Run(tt.name, func(t *testing.T) {
+			body := newTrackingReadCloser(tt.response)
+			s.client.EXPECT().Do(gomock.Any()).Return(&http.Response{
+				Status:     "200 OK",
+				StatusCode: http.StatusOK,
+				Body:       body,
+				Header:     http.Header{},
+			}, nil)
+
+			gather := s.newGather([]*configs.HTTPTaskStepConfig{tt.step}, false)
+			event := NewEvent(gather)
+			ok := gather.GatherURL(context.Background(), event, tt.step, tt.step.URL, net.IPv4(127, 0, 0, 1).String())
+
+			s.True(ok)
+			s.True(body.readToEOF)
+			s.True(body.closed)
+			s.Equal(1, body.closeCount)
+		})
+	}
 }
